@@ -83,15 +83,59 @@
 //! # }
 //! ```
 
+//! ## Truncated tags
+//!
+//! NIST SP 800-232 permits truncating the 128-bit tag to between 32 and 128 bits.
+//! [`AsconAead128Trunc`] does this; its tag size is a [`typenum`](aead::array::typenum)
+//! type parameter between `U4` and `U16` (bytes):
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn core::error::Error>> {
+//! use ascon_aead128::{
+//!     aead::{AeadInOut, KeyInit, consts::U4},
+//!     AsconAead128Trunc,
+//! };
+//!
+//! let cipher = AsconAead128Trunc::<U4>::new(&Default::default());
+//! let nonce = Default::default(); // MUST be unique per message
+//! let mut buf = *b"plaintext message";
+//!
+//! let tag = cipher.encrypt_inout_detached(&nonce, b"", (&mut buf[..]).into())?;
+//! assert_eq!(tag.len(), 4);
+//! cipher.decrypt_inout_detached(&nonce, b"", (&mut buf[..]).into(), &tag)?;
+//! assert_eq!(&buf, b"plaintext message");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Tag sizes outside `4..=16` do not compile:
+//!
+//! ```compile_fail
+//! use ascon_aead128::{aead::consts::U3, AsconAead128Trunc};
+//! let _: Option<AsconAead128Trunc<U3>> = None;
+//! ```
+//!
+//! **Security note:** a `t`-bit tag gives a forgery probability of `2^-t` per attempt.
+//! With short tags, limit and count failed verifications per key and rekey when the
+//! limit is reached.
+
 mod asconcore;
 
 pub use aead::{self, Error, Key, Nonce, Tag};
 #[cfg(feature = "zeroize")]
 pub use zeroize;
 
-use aead::{AeadCore, AeadInOut, KeyInit, KeySizeUser, TagPosition, consts::U16, inout::InOutBuf};
+use aead::{
+    AeadCore, AeadInOut, KeyInit, KeySizeUser, TagPosition,
+    array::{
+        ArraySize,
+        typenum::{IsGreaterOrEqual, IsLessOrEqual, True},
+    },
+    consts::{U4, U16},
+    inout::InOutBuf,
+};
 use asconcore::{AsconCore, Parameters, Parameters128};
-use core::fmt;
+use core::{fmt, marker::PhantomData};
 
 /// Ascon generic over some Parameters
 ///
@@ -153,7 +197,7 @@ impl<P: Parameters> AeadInOut for Ascon<P> {
         }
 
         let mut core = AsconCore::<P>::new(&self.key, nonce);
-        core.decrypt_inout(buffer, associated_data, tag)
+        core.decrypt_inout(buffer, associated_data, &tag[..])
     }
 }
 
@@ -204,6 +248,93 @@ impl AeadInOut for AsconAead128 {
     ) -> Result<(), Error> {
         self.0
             .decrypt_inout_detached(nonce, associated_data, buffer, tag)
+    }
+}
+
+/// Marker trait for tag sizes (in bytes) permitted by NIST SP 800-232: `U4..=U16`.
+///
+/// Implemented automatically for every [`typenum`](aead::array::typenum) unsigned integer in
+/// that range.
+pub trait ValidTagSize: ArraySize {}
+
+impl<T> ValidTagSize for T where
+    T: ArraySize + IsGreaterOrEqual<U4, Output = True> + IsLessOrEqual<U16, Output = True>
+{
+}
+
+/// Ascon-AEAD128 with the tag truncated to `T` bytes (`U4..=U16`).
+///
+/// The tag is the first `T` bytes of the standard 128-bit tag, so `AsconAead128Trunc<U16>`
+/// is identical to [`AsconAead128`]. Verification compares the truncated tag in constant time.
+pub struct AsconAead128Trunc<T: ValidTagSize>(Ascon<Parameters128>, PhantomData<T>);
+
+/// Key for [`AsconAead128Trunc`]
+pub type AsconAead128TruncKey<T> = Key<AsconAead128Trunc<T>>;
+/// Nonce for [`AsconAead128Trunc`]
+pub type AsconAead128TruncNonce<T> = Nonce<AsconAead128Trunc<T>>;
+/// Truncated tag for [`AsconAead128Trunc`]
+pub type AsconAead128TruncTag<T> = Tag<AsconAead128Trunc<T>>;
+
+impl<T: ValidTagSize> KeySizeUser for AsconAead128Trunc<T> {
+    type KeySize = U16;
+}
+
+impl<T: ValidTagSize> KeyInit for AsconAead128Trunc<T> {
+    fn new(key: &Key<Self>) -> Self {
+        Self(Ascon::<Parameters128>::new(key), PhantomData)
+    }
+}
+
+impl<T: ValidTagSize> AeadCore for AsconAead128Trunc<T> {
+    type NonceSize = U16;
+    type TagSize = T;
+    const TAG_POSITION: TagPosition = TagPosition::Postfix;
+}
+
+impl<T: ValidTagSize> AeadInOut for AsconAead128Trunc<T> {
+    fn encrypt_inout_detached(
+        &self,
+        nonce: &Nonce<Self>,
+        associated_data: &[u8],
+        buffer: InOutBuf<'_, '_, u8>,
+    ) -> Result<Tag<Self>, Error> {
+        if (buffer.len() as u64)
+            .checked_add(associated_data.len() as u64)
+            .is_none()
+        {
+            return Err(Error);
+        }
+
+        let mut core = AsconCore::<Parameters128>::new(&self.0.key, nonce);
+        let full = core.encrypt_inout(buffer, associated_data);
+
+        let mut tag = Tag::<Self>::default();
+        tag.copy_from_slice(&full[..T::USIZE]);
+        Ok(tag)
+    }
+
+    fn decrypt_inout_detached(
+        &self,
+        nonce: &Nonce<Self>,
+        associated_data: &[u8],
+        buffer: InOutBuf<'_, '_, u8>,
+        tag: &Tag<Self>,
+    ) -> Result<(), Error> {
+        if (buffer.len() as u64)
+            .checked_add(associated_data.len() as u64)
+            .is_none()
+        {
+            return Err(Error);
+        }
+
+        let mut core = AsconCore::<Parameters128>::new(&self.0.key, nonce);
+        core.decrypt_inout(buffer, associated_data, &tag[..])
+    }
+}
+
+impl<T: ValidTagSize> fmt::Debug for AsconAead128Trunc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsconAead128Trunc").finish_non_exhaustive()
     }
 }
 

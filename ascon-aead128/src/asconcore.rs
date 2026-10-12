@@ -7,6 +7,11 @@ use aead::{
 use ascon::{State, permute8, permute12};
 use ctutils::CtEq;
 
+/// Shortest tag permitted by NIST SP 800-232 (32 bits).
+pub(crate) const MIN_TAG_LEN: usize = 4;
+/// Full tag length (128 bits).
+pub(crate) const MAX_TAG_LEN: usize = 16;
+
 /// Produce mask for padding.
 #[inline(always)]
 const fn pad(n: usize) -> u64 {
@@ -263,17 +268,26 @@ impl<'a, P: Parameters> AsconCore<'a, P> {
         Array::from(self.process_final())
     }
 
+    /// Decrypt and verify.
+    ///
+    /// `expected_tag` may be a truncated tag of 4..=16 bytes. It is compared in constant time
+    /// against the leading bytes of the full 128-bit tag, as permitted by NIST SP 800-232.
     pub(crate) fn decrypt_inout(
         &mut self,
         mut ciphertext: InOutBuf<'_, '_, u8>,
         associated_data: &[u8],
-        expected_tag: &Array<u8, U16>,
+        expected_tag: &[u8],
     ) -> Result<(), Error> {
+        let n = expected_tag.len();
+        if !(MIN_TAG_LEN..=MAX_TAG_LEN).contains(&n) {
+            return Err(Error);
+        }
+
         self.process_associated_data(associated_data);
         self.process_decrypt_inout(ciphertext.reborrow());
 
         let tag = self.process_final();
-        if tag.ct_eq(&expected_tag.0).to_bool() {
+        if tag[..n].ct_eq(expected_tag).to_bool() {
             Ok(())
         } else {
             ciphertext.get_out().fill(0);

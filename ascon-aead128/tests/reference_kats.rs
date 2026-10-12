@@ -14,3 +14,10 @@ aead::new_fail_test!(
     "reference_kats_fail",
     AsconAead128
 );
+
+// Truncation-capable type at full tag size must pass the same reference KATs.
+aead::new_pass_test!(
+    ascon_aead_trunc16_reference_kats_pass,
+    "reference_kats_pass",
+    ascon_aead128::AsconAead128Trunc<aead::consts::U16>
+);
